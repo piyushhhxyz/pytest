@@ -1,4 +1,5 @@
 import pytest
+from _pytest._code.code import ExceptionInfo
 from _pytest.pathlib import Path
 from _pytest.reports import CollectReport
 from _pytest.reports import TestReport
@@ -242,27 +243,32 @@ class TestReportSerialization:
         ):
             TestReport._from_json(data)
 
-    def test_chained_exception_serialization(self, testdir):
+    def test_chained_exception_serialization(self):
         """Regression: chained exceptions must survive _to_json/_from_json so
         the full chain is preserved, not just the outermost exception. Also
         verifies the top-level reprcrash points to the outermost exception
         (matching ExceptionChainRepr's own invariant).
         """
-        testdir.makepyfile(
-            """
-            def test_chained():
+        try:
+            try:
                 try:
                     raise ValueError(11)
                 except Exception as e1:
-                    try:
-                        raise ValueError(12) from e1
-                    except Exception as e2:
-                        raise ValueError(13) from e2
-            """
+                    raise ValueError(12) from e1
+            except Exception as e2:
+                raise ValueError(13) from e2
+        except Exception:
+            ei = ExceptionInfo.from_current()
+
+        report = TestReport(
+            nodeid="test_chained",
+            location=("test_chained.py", 1, "test_chained"),
+            keywords={},
+            outcome="failed",
+            longrepr=ei.getrepr(chain=True),
+            when="call",
         )
-        reprec = testdir.inline_run()
-        rep = reprec.getreports("pytest_runtest_logreport")[1]
-        restored = TestReport._from_json(rep._to_json())
+        restored = TestReport._from_json(report._to_json())
         text = restored.longreprtext
         assert "ValueError: 11" in text
         assert "ValueError: 12" in text
@@ -277,22 +283,27 @@ class TestReportSerialization:
         assert restored.longrepr.reprcrash is not None
         assert "ValueError: 13" in restored.longrepr.reprcrash.message
 
-    def test_chained_exception_backward_compat_no_chain_key(self, testdir):
+    def test_chained_exception_backward_compat_no_chain_key(self):
         """Old serialized payloads without a 'chain' key must still deserialize
         via the outer "reprcrash"/"reprtraceback" (which _to_json() always
         emits for this reason)."""
-        testdir.makepyfile(
-            """
-            def test_chained():
-                try:
-                    raise ValueError(1)
-                except Exception as e:
-                    raise ValueError(2) from e
-            """
+        try:
+            try:
+                raise ValueError(1)
+            except Exception as e:
+                raise ValueError(2) from e
+        except Exception:
+            ei = ExceptionInfo.from_current()
+
+        report = TestReport(
+            nodeid="test_chained",
+            location=("test_chained.py", 1, "test_chained"),
+            keywords={},
+            outcome="failed",
+            longrepr=ei.getrepr(chain=True),
+            when="call",
         )
-        reprec = testdir.inline_run()
-        rep = reprec.getreports("pytest_runtest_logreport")[1]
-        data = rep._to_json()
+        data = report._to_json()
         # Simulate a payload from a sender that doesn't know about "chain".
         assert "chain" in data["longrepr"]
         del data["longrepr"]["chain"]
