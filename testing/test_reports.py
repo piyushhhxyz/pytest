@@ -311,6 +311,37 @@ class TestReportSerialization:
         # Outermost exception must still survive.
         assert "ValueError: 2" in restored.longreprtext
 
+    def test_chained_exception_collect_report_roundtrip(self):
+        """CollectReport with a chained exception must also round-trip correctly.
+
+        test_collectreport_fail / test_extended_report_deserialization cover
+        CollectReport serialization but rely on testdir.inline_run() which
+        fails on Python 3.12 due to the assertion-rewriter bug. This test
+        exercises the same CollectReport._to_json()/_from_json() path directly.
+        """
+        try:
+            try:
+                raise ValueError(51)
+            except Exception as e1:
+                raise ValueError(52) from e1
+        except Exception:
+            ei = ExceptionInfo.from_current()
+
+        report = CollectReport(
+            nodeid="test_chained.py",
+            outcome="failed",
+            longrepr=ei.getrepr(chain=True),
+            result=[],
+        )
+        restored = CollectReport._from_json(report._to_json())
+        text = restored.longreprtext
+        assert "ValueError: 51" in text
+        assert "ValueError: 52" in text
+        assert (
+            "The above exception was the direct cause of the following exception:"
+            in text
+        )
+
 
 class TestHooks:
     """Test that the hooks are working correctly for plugins"""
