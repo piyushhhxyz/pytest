@@ -1,4 +1,5 @@
 from pprint import pprint
+from typing import NoReturn
 from typing import Optional
 
 import py
@@ -180,14 +181,26 @@ class BaseReport:
             return result
 
         def serialize_repr_crash(reprcrash):
+            # reprcrash may be None for entries deep in an exception chain
+            # when the cause/context exception has no traceback
+            # (see FormattedExcinfo.repr_excinfo in _pytest/_code/code.py).
             if reprcrash is not None:
                 return reprcrash.__dict__.copy()
             return None
 
         def disassembled_report(rep):
             longrepr = rep.longrepr
+            result = {
+                "reprcrash": serialize_repr_crash(longrepr.reprcrash),
+                "reprtraceback": serialize_repr_traceback(longrepr.reprtraceback),
+                "sections": longrepr.sections,
+            }
+            # For chained exceptions, serialize the whole chain additively.
+            # The top-level reprcrash/reprtraceback above are kept for backward
+            # compat with deserializers that don't know about "chain" — they
+            # will still see the outermost exception.
             if isinstance(longrepr, ExceptionChainRepr):
-                chain = [
+                result["chain"] = [
                     {
                         "reprtraceback": serialize_repr_traceback(reprtraceback),
                         "reprcrash": serialize_repr_crash(reprcrash),
@@ -195,23 +208,7 @@ class BaseReport:
                     }
                     for reprtraceback, reprcrash, descr in longrepr.chain
                 ]
-                return {
-                    "chain": chain,
-                    # Keep top-level reprcrash/reprtraceback for backward compat
-                    # (older deserializers that don't know about "chain" will still
-                    # see the outermost exception).
-                    "reprcrash": serialize_repr_crash(longrepr.reprcrash),
-                    "reprtraceback": serialize_repr_traceback(longrepr.reprtraceback),
-                    "sections": longrepr.sections,
-                }
-            else:
-                reprtraceback = serialize_repr_traceback(longrepr.reprtraceback)
-                reprcrash = serialize_repr_crash(longrepr.reprcrash)
-                return {
-                    "reprcrash": reprcrash,
-                    "reprtraceback": reprtraceback,
-                    "sections": longrepr.sections,
-                }
+            return result
 
         d = self.__dict__.copy()
         if hasattr(self.longrepr, "toterminal"):
@@ -274,11 +271,16 @@ class BaseReport:
             return ReprTraceback(**reprtraceback_dict)
 
         def deserialize_repr_crash(reprcrash_dict):
+            # Mirrors serialize_repr_crash: may be None for chain entries
+            # whose exception has no traceback.
             if reprcrash_dict is not None:
                 return ReprFileLocation(**reprcrash_dict)
             return None
 
         if reportdict["longrepr"]:
+            # _to_json() always emits both "reprcrash" and "reprtraceback" when
+            # longrepr is a TerminalRepr-like; this guard also tolerates
+            # externally-constructed/legacy payloads that only provide a string.
             if (
                 "reprcrash" in reportdict["longrepr"]
                 and "reprtraceback" in reportdict["longrepr"]
@@ -314,7 +316,9 @@ class BaseReport:
         return cls(**reportdict)
 
 
-def _report_unserialization_failure(type_name, report_class, reportdict):
+def _report_unserialization_failure(
+    type_name: str, report_class, reportdict
+) -> "NoReturn":
     url = "https://github.com/pytest-dev/pytest/issues"
     stream = py.io.TextIO()
     pprint("-" * 100, stream=stream)

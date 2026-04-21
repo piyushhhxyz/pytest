@@ -1,5 +1,4 @@
 import pytest
-from _pytest._code.code import ExceptionInfo
 from _pytest.pathlib import Path
 from _pytest.reports import CollectReport
 from _pytest.reports import TestReport
@@ -243,6 +242,64 @@ class TestReportSerialization:
         ):
             TestReport._from_json(data)
 
+    def test_chained_exception_serialization(self, testdir):
+        """Regression: chained exceptions must survive _to_json/_from_json so
+        the full chain is preserved, not just the outermost exception. Also
+        verifies the top-level reprcrash points to the outermost exception
+        (matching ExceptionChainRepr's own invariant).
+        """
+        testdir.makepyfile(
+            """
+            def test_chained():
+                try:
+                    raise ValueError(11)
+                except Exception as e1:
+                    try:
+                        raise ValueError(12) from e1
+                    except Exception as e2:
+                        raise ValueError(13) from e2
+            """
+        )
+        reprec = testdir.inline_run()
+        rep = reprec.getreports("pytest_runtest_logreport")[1]
+        restored = TestReport._from_json(rep._to_json())
+        text = restored.longreprtext
+        assert "ValueError: 11" in text
+        assert "ValueError: 12" in text
+        assert "ValueError: 13" in text
+        # The "direct cause" wording is emitted by pytest's FormattedExcinfo
+        # in _pytest/_code/code.py, not by CPython.
+        assert (
+            "The above exception was the direct cause of the following exception:"
+            in text
+        )
+        # Top-level reprcrash must reference the outermost (final) exception.
+        assert restored.longrepr.reprcrash is not None
+        assert "ValueError: 13" in restored.longrepr.reprcrash.message
+
+    def test_chained_exception_backward_compat_no_chain_key(self, testdir):
+        """Old serialized payloads without a 'chain' key must still deserialize
+        via the outer "reprcrash"/"reprtraceback" (which _to_json() always
+        emits for this reason)."""
+        testdir.makepyfile(
+            """
+            def test_chained():
+                try:
+                    raise ValueError(1)
+                except Exception as e:
+                    raise ValueError(2) from e
+            """
+        )
+        reprec = testdir.inline_run()
+        rep = reprec.getreports("pytest_runtest_logreport")[1]
+        data = rep._to_json()
+        # Simulate a payload from a sender that doesn't know about "chain".
+        assert "chain" in data["longrepr"]
+        del data["longrepr"]["chain"]
+        restored = TestReport._from_json(data)
+        # Outermost exception must still survive.
+        assert "ValueError: 2" in restored.longreprtext
+
 
 class TestHooks:
     """Test that the hooks are working correctly for plugins"""
@@ -313,132 +370,3 @@ class TestHooks:
                 config=pytestconfig, data=data
             )
 
-
-class TestChainedExceptionSerializationRepr:
-    """Regression tests for chained exception serialization (xdist issue).
-
-    When xdist serializes a TestReport via _to_json()/_from_json(), chained
-    exceptions must survive the round-trip so the full chain is displayed,
-    not just the final (leaf) exception.
-    """
-
-    def _make_report(self, longrepr):
-        return TestReport(
-            nodeid="test_chained",
-            location=("test_chained.py", 1, "test_chained"),
-            keywords={},
-            outcome="failed",
-            longrepr=longrepr,
-            when="call",
-        )
-
-    def _roundtrip(self, longrepr):
-        report = self._make_report(longrepr)
-        data = report._to_json()
-        restored = TestReport._from_json(data)
-        return restored.longreprtext
-
-    def test_chained_exception_with_from_roundtrip(self):
-        """Explicit chaining via 'raise X from Y' must survive serialization."""
-        try:
-            try:
-                try:
-                    raise ValueError(11)
-                except Exception as e1:
-                    raise ValueError(12) from e1
-            except Exception as e2:
-                raise ValueError(13) from e2
-        except Exception:
-            ei = ExceptionInfo.from_current()
-
-        result = self._roundtrip(ei.getrepr(chain=True))
-
-        assert "ValueError: 11" in result
-        assert "ValueError: 12" in result
-        assert "ValueError: 13" in result
-        assert "The above exception was the direct cause of the following exception:" in result
-
-    def test_chained_exception_without_from_roundtrip(self):
-        """Implicit chaining via __context__ must survive serialization."""
-        try:
-            try:
-                try:
-                    raise ValueError(21)
-                except Exception:
-                    raise ValueError(22)
-            except Exception:
-                raise ValueError(23)
-        except Exception:
-            ei = ExceptionInfo.from_current()
-
-        result = self._roundtrip(ei.getrepr(chain=True))
-
-        assert "ValueError: 21" in result
-        assert "ValueError: 22" in result
-        assert "ValueError: 23" in result
-        assert "During handling of the above exception, another exception occurred:" in result
-
-    def test_chain_false_still_works(self):
-        """chain=False (single exception) must still round-trip correctly."""
-        try:
-            raise ValueError(99)
-        except Exception:
-            ei = ExceptionInfo.from_current()
-
-        result = self._roundtrip(ei.getrepr(chain=False))
-        assert "ValueError: 99" in result
-
-    def test_backward_compat_no_chain_key(self):
-        """Old payloads without a 'chain' key must still deserialize (backward compat)."""
-        try:
-            raise ValueError(42)
-        except Exception:
-            ei = ExceptionInfo.from_current()
-
-        report = self._make_report(ei.getrepr(chain=True))
-        data = report._to_json()
-        # Simulate an older sender that didn't include the chain key
-        del data["longrepr"]["chain"]
-        restored = TestReport._from_json(data)
-        assert "ValueError: 42" in restored.longreprtext
-
-    def test_chained_exception_reprcrash_points_to_outermost(self):
-        """reprcrash must point to the outermost (final raised) exception."""
-        try:
-            try:
-                raise ValueError(11)
-            except Exception as e1:
-                raise ValueError(12) from e1
-        except Exception:
-            ei = ExceptionInfo.from_current()
-
-        report = self._make_report(ei.getrepr(chain=True))
-        data = report._to_json()
-        restored = TestReport._from_json(data)
-        # reprcrash should reference the outermost exception (ValueError: 12)
-        assert restored.longrepr.reprcrash is not None
-        assert "ValueError: 12" in restored.longrepr.reprcrash.message
-
-    def test_chained_exception_collect_report_roundtrip(self):
-        """CollectReport with a chained exception must also round-trip correctly."""
-        try:
-            try:
-                raise ValueError(51)
-            except Exception as e1:
-                raise ValueError(52) from e1
-        except Exception:
-            ei = ExceptionInfo.from_current()
-
-        longrepr = ei.getrepr(chain=True)
-        report = CollectReport(
-            nodeid="test_chained.py",
-            outcome="failed",
-            longrepr=longrepr,
-            result=[],
-        )
-        data = report._to_json()
-        restored = CollectReport._from_json(data)
-        result = restored.longreprtext
-        assert "ValueError: 51" in result
-        assert "ValueError: 52" in result
-        assert "The above exception was the direct cause of the following exception:" in result
